@@ -344,7 +344,7 @@ func Open(opt Options) (*DB, error) {
 	if !opt.ReadOnly{
 		// No background compactions
 		// Other way to do is set numCompactors to zero in options
-		if opt.PartitionFanOut != 0{
+		if opt.PartitionFanOut == 0 {
 			db.closers.compactors = z.NewCloser(1)
 			db.lc.startCompact(db.closers.compactors)
 		}
@@ -1630,6 +1630,9 @@ func (db *DB) startMemoryFlush() {
 // stopped. Ideally, no writes are going on during Flatten. Otherwise, it would create competition
 // between flattening the tree and new tables being created at level zero.
 func (db *DB) Flatten(workers int) error {
+	if db.opt.PartitionFanOut > 0 {
+		return db.lc.flattenPartitions()
+	}
 
 	db.stopCompactions()
 	defer db.startCompactions()

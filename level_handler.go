@@ -74,6 +74,20 @@ func (s *levelHandler) initTables(tables []*table.Table) {
 	}
 }
 
+func (s *levelHandler) initPartitionedTables(tables []*table.Table) {
+	s.Lock()
+	defer s.Unlock()
+	s.totalSize = 0
+	for _, t := range tables {
+		pid := int(getPartitionID(s.level, t.Smallest(), s.db.opt.PartitionFanOut))
+		s.partitionedTables[pid] = append(s.partitionedTables[pid], t)
+		s.totalSize += int64(t.OnDiskSize())
+	}
+	for _, tbls := range s.partitionedTables {
+		sort.Slice(tbls, func(i, j int) bool { return tbls[i].ID() < tbls[j].ID() })
+	}
+}
+
 // deleteTables remove tables idx0, ..., idx1-1.
 func (s *levelHandler) deleteTables(toDel []*table.Table) error {
 	s.Lock() // s.Unlock() below
@@ -234,6 +248,13 @@ func (s *levelHandler) close() error {
 			err = closeErr
 		}
 	}
+	for _, tbls := range s.partitionedTables {
+		for _, t := range tbls {
+			if closeErr := t.Close(-1); closeErr != nil && err == nil {
+				err = closeErr
+			}
+		}
+	}
 	return y.Wrap(err, "levelHandler.close")
 }
 
@@ -241,6 +262,28 @@ func (s *levelHandler) close() error {
 func (s *levelHandler) getTableForKey(key []byte) ([]*table.Table, func() error) {
 	s.RLock()
 	defer s.RUnlock()
+
+	if s.partitionedTables != nil {
+		part := s.partitionedTables[int(getPartitionID(s.level, key, s.db.opt.PartitionFanOut))]
+		out := make([]*table.Table, 0, len(part)+len(s.tables))
+		for i := len(part) - 1; i >= 0; i-- {
+			out = append(out, part[i])
+		}
+		for i := len(s.tables) - 1; i >= 0; i-- {
+			out = append(out, s.tables[i])
+		}
+		for _, t := range out {
+			t.IncrRef()
+		}
+		return out, func() error {
+			for _, t := range out {
+				if err := t.DecrRef(); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
 
 	if s.level == 0 {
 		// For level 0, we need to check every table. Remember to make a copy as s.tables may change
@@ -313,6 +356,27 @@ func (s *levelHandler) appendIterators(iters []y.Iterator, opt *IteratorOptions)
 	var topt int
 	if opt.Reverse {
 		topt = table.REVERSED
+	}
+	if s.partitionedTables != nil {
+		pids := make([]int, 0, len(s.partitionedTables))
+		for pid := range s.partitionedTables {
+			pids = append(pids, pid)
+		}
+		sort.Ints(pids)
+		var out []*table.Table
+		for _, pid := range pids {
+			for _, t := range s.partitionedTables[pid] {
+				if opt.pickTable(t) {
+					out = append(out, t)
+				}
+			}
+		}
+		for _, t := range s.tables {
+			if opt.pickTable(t) {
+				out = append(out, t)
+			}
+		}
+		return appendIteratorsReversed(iters, out, topt)
 	}
 	if s.level == 0 {
 		// Remember to add in reverse order!
